@@ -1,12 +1,51 @@
 # elevenlabs-cost-guard
 
-A careful client for the ElevenLabs text-to-speech API, built to stop you paying for audio you don't need:
+A small TypeScript client for the ElevenLabs text-to-speech API that stops a pipeline paying again for audio it already has. It also turns ElevenLabs' character timings into word timings and captions.
 
-- **It never pays twice for the same line.** Every recording is keyed by a hash of everything that changes the audio, so unchanged lines are skipped.
-- **It never pays for a request that would fail.** Tags, model limits and inputs are checked before any call is made.
-- **It only retries what's worth retrying.** Rate limits and server errors get backoff; bad requests fail at once, with the reason.
+## The problem it solves
 
-It also turns the `with-timestamps` response into word timings and SRT captions. About 250 lines of tested TypeScript, extracted from a production pipeline that has voiced around 1,400 clips on Eleven v3 and v4.
+The ElevenLabs API bills every request by the character, even when the text, voice and settings are exactly the same as a request you made yesterday. The website gives two free regenerations of identical content, but the API doesn't ([ElevenLabs](https://elevenlabs.io/blog/two-free-regenerations)). And neither the API nor the official SDK keeps a record of what you've already generated.
+
+For one-off calls that doesn't matter. For a pipeline that builds audio from a script, it does: change one line, rebuild, and every line is sent and billed again. ElevenLabs' own integration guide recommends the fix, which is to cache each result under a hash of every input that affects the audio ([ElevenLabs, Text to Speech API integration](https://elevenlabs.io/blog/text-to-speech-api-integration)). This client implements that, plus two smaller jobs the API leaves to you:
+
+| Gap | What the API and SDK give you | What this adds |
+|---|---|---|
+| Paying again for audio you already have | Every request is billed; nothing remembers past requests by their inputs | A hash of model, voice, language, text and direction as the cache key. Unchanged lines are never sent |
+| Words, not characters | `with-timestamps` returns a start and end time per **character** | Word timings (ignoring `[audio tags]`) and SRT captions |
+| Mistakes found halfway through a batch | The API rejects bad input when each request arrives | Tags and per-model length limits are checked before anything is sent, so a bad line fails first, not at line 60 of 90 |
+
+Retries are not a gap: the official SDK already retries 408, 409, 429 and 5xx responses. This client calls the API with plain `fetch`, so it implements the rule itself: 429 and 5xx only, exponential backoff with jitter, as the integration guide recommends.
+
+## Has it saved money?
+
+Yes, measurably, although the money isn't the biggest win.
+
+This code comes from a production audio pipeline. Reconstructing that pipeline's git history from 1 September to 5 October 2026, across ten finished productions:
+
+| | With the cache | Without it |
+|---|---|---|
+| Rebuilds of the audio (committed ones only) | 103 | 103 |
+| Lines sent to ElevenLabs | 675 | 9,729 |
+| Characters billed | about 41,000 | about 601,000 |
+
+That's about **560,000 characters (93%) not billed again**: roughly $45 at v3's API price of $0.08 per 1,000 characters, or the same amount of a subscription's monthly allowance. Treat it as a floor, because rebuilds that never got committed aren't counted.
+
+The bigger win is stability. A re-recorded line rarely comes back identical, because its timing and delivery vary between generations. Without the cache, every rebuild would shift the cuts, timings and captions of work that was already finished.
+
+## When you need it: an example
+
+You finish a 90-line production, about 6,000 characters, and then fix a typo in one line.
+
+- **Without a cache**, rebuilding sends all 90 lines again. You pay for about 6,000 characters, and every line comes back slightly different, so the finished edit drifts.
+- **With it**, only the edited line has a new hash. One request goes out (about 60 characters) and everything else is reused as it is.
+
+A real case from the pipeline above: one production was revised at least 18 times after its first recording. Those revisions sent 8,570 characters of changed lines. Re-sending the whole production each time would have been 112,353.
+
+The same thing happens when you:
+
+- **Switch new work to a new model.** The model is part of the hash, so set it per piece of work, not globally. A global switch re-records everything you've already finished.
+- **Add direction tags to a few lines.** Only those lines are re-sent. An empty direction hashes exactly like no direction, so adding the feature didn't invalidate older audio.
+- **Rebuild everything in CI on every commit.** Unchanged lines cost nothing.
 
 ## Quick start
 
@@ -32,20 +71,18 @@ const req = {
   direction: { tags: ["whispering"], stability: "natural" as const },
 };
 
-const key = ttsSourceHash(req);        // look this up before calling: same key, same audio
+const key = ttsSourceHash(req);        // check your store for this key first: same key, same audio
 const { audio, wordTimings, durationS } = await new ElevenLabsClient(process.env.ELEVENLABS_API_KEY!).synthesize(req);
 const srt = toSrt(captionsFromWords(wordTimings));
 ```
 
-## How it avoids wasted spend
+## What's checked before a request
 
-**1. A content hash as the cache key.** `ttsSourceHash` is a SHA-256 of model, voice, language, text and direction: everything that changes the audio, and nothing that doesn't. If the hash already has a file, the line hasn't changed and isn't sent. An empty direction hashes exactly like no direction, so adding direction support didn't invalidate any existing recordings.
+- Direction tags: no brackets or line breaks, at most 8 per line.
+- Tags are only sent to models that read them (`eleven_v3`, `eleven_v4`).
+- Length, with the tags counted in: 5,000 characters on v3, 10,000 on v4.
 
-Because the model is part of the hash, switching every line to a new model would re-record everything you've already made. Set the model per batch of work (a chapter, an episode, a campaign) so finished work stays untouched while new work uses the new model.
-
-**2. Validation before the paid call.** Direction tags are checked (no brackets or line breaks, at most 8), only sent to models that read them, and counted towards the model's limit: 5,000 characters on v3, 10,000 on v4. A bad line throws before any request is made.
-
-**3. Retries only where they can help.** 429 and 5xx responses get up to three attempts with exponential backoff (1 s, then 2 s). A 400, 401 or 422 won't get better on a second try, so it fails at once with the status and the start of the response body.
+A failing line throws before any request is made, so a batch stops at the first bad line instead of partway through.
 
 ## Word timings
 
@@ -89,10 +126,10 @@ On v4 a vague tag can come out as a sound effect, so write tags as voice descrip
 
 | File | What it does |
 |---|---|
+| `src/cache.ts` | The content hash used as each recording's cache key |
 | `src/client.ts` | The `with-timestamps` call, retries and result |
-| `src/cache.ts` | The content hash used as the recording's cache key |
-| `src/models.ts` | Per-model limits, stability steps, validation before the call |
-| `src/alignment.ts` | Character alignment to word timings |
+| `src/models.ts` | Per-model limits, stability steps, checks before the call |
+| `src/alignment.ts` | Character timings to word timings |
 | `src/captions.ts` | Caption splitting, wrapping and SRT output |
 | `examples/speak.ts` | One line in; audio, word timings and SRT out, skipped if unchanged |
 

@@ -25,7 +25,8 @@ export class ElevenLabsClient implements TtsClient {
     const delay = this.opts.retryDelayMs ?? 1000;
     let lastError = "";
     for (let attempt = 0; attempt < attempts; attempt++) {
-      if (attempt > 0) await new Promise((r) => setTimeout(r, delay * 2 ** (attempt - 1)));
+      // Exponential backoff with full jitter, so many clients hitting a rate limit don't all retry at once.
+      if (attempt > 0) await new Promise((r) => setTimeout(r, Math.random() * delay * 2 ** (attempt - 1)));
       const res = await this.fetchImpl(url, {
         method: "POST",
         headers: { "xi-api-key": this.apiKey, "content-type": "application/json" },
