@@ -54,30 +54,99 @@ Stable keys also keep edits stable. A re-recorded line rarely comes back identic
 
 ```bash
 npm install
-npm test        # 30 tests, mocked fetch, no API key needed
+npm test        # 34 tests, mocked fetch, no API key needed
 
 ELEVENLABS_API_KEY=... npm run speak -- <voice_id> "Guten Tag! Wie geht es dir?" --model eleven_v4 --lang de --tag whispering
 ```
 
-`speak` writes `out/<hash>.mp3`, `out/<hash>.words.json` and `out/<hash>.srt`. Running it again with the same input makes no API call, because that hash already has a recording.
+`speak` records one line through `getLine` and writes `audio/<key>.mp3`, `audio/<key>.words.json` and `audio/<key>.srt`. The first run prints `Recorded with ElevenLabs (paid)`. Run the same command again and it prints `Reused … (no API call, no charge)`, and doesn't even need the API key.
 
 ## Usage
 
-```ts
-import { ElevenLabsClient, ttsSourceHash, captionsFromWords, toSrt } from "./src/index.js";
+Every line in a script goes through the same three steps:
 
-const req = {
-  voiceId: "<voice_id>",
-  text: "Guten Tag! Wie geht es dir?",
-  modelId: "eleven_v4",
-  languageCode: "de",
-  direction: { tags: ["whispering"], stability: "natural" as const },
+```
+for each line in the script:
+    key = hash(model, voice, language, text, direction)
+
+    if audio/<key>.mp3 is already saved:
+        use the saved file              <- free: no API call, no charge
+    else:
+        call ElevenLabs                 <- the only step that costs money
+        save the result as audio/<key>.mp3
+```
+
+That is exactly what `getLine` does (`src/line.ts`):
+
+```ts
+import { existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { ttsSourceHash } from "./cache.js";
+import type { TtsClient, TtsRequest, WordTiming } from "./types.js";
+
+export type LineResult = {
+  key: string;
+  file: string;
+  audio: Buffer;
+  wordTimings: WordTiming[];
+  paid: boolean; // true = ElevenLabs was called for this line; false = the saved file was reused
 };
 
-const key = ttsSourceHash(req);        // look this key up in the store first
-const { audio, wordTimings, durationS } = await new ElevenLabsClient(process.env.ELEVENLABS_API_KEY!).synthesize(req);
-const srt = toSrt(captionsFromWords(wordTimings));
+// The cost guard: if this exact line has been recorded before, reuse the saved file.
+// Otherwise call ElevenLabs once, save the result, and reuse it from then on.
+export async function getLine(client: TtsClient, req: TtsRequest, dir = "audio"): Promise<LineResult> {
+  // 1. One key for everything that affects the sound: model, voice, language, text, direction.
+  //    Same inputs always give the same key.
+  const key = ttsSourceHash(req);
+  const file = join(dir, `${key}.mp3`);
+  const wordsFile = join(dir, `${key}.words.json`);
+
+  // 2. Already have the audio for this key? Use it. No API call, no charge.
+  if (existsSync(file) && existsSync(wordsFile)) {
+    return {
+      key,
+      file,
+      paid: false,
+      audio: await readFile(file),
+      wordTimings: JSON.parse(await readFile(wordsFile, "utf8")) as WordTiming[],
+    };
+  }
+
+  // 3. Otherwise the line is new or has changed: call ElevenLabs (the only paid step) and save it.
+  const { audio, wordTimings } = await client.synthesize(req);
+  await mkdir(dir, { recursive: true });
+  await writeFile(wordsFile, JSON.stringify(wordTimings));
+  await writeFile(file, audio);
+  return { key, file, paid: true, audio, wordTimings };
+}
 ```
+
+Call it for every line, on every build:
+
+```ts
+import { ElevenLabsClient, getLine } from "./src/index.js";
+
+const client = new ElevenLabsClient(process.env.ELEVENLABS_API_KEY!);
+
+const script = [
+  { voiceId: "<narrator_voice_id>", text: "Der Laden öffnet um neun." },
+  { voiceId: "<character_voice_id>", text: "Guten Tag! Wie geht es dir?" },
+];
+
+for (const line of script) {
+  const { paid, file } = await getLine(client, { ...line, modelId: "eleven_v4", languageCode: "de" });
+  console.log(paid ? `recorded ${file}` : `reused   ${file}`);
+}
+```
+
+| Build | Output |
+|---|---|
+| First run | `recorded` for both lines |
+| Second run, nothing changed | `reused` for both lines; ElevenLabs is not called |
+| One line's text edited | `recorded` for that line only, `reused` for the other |
+
+The recording's word timings are saved beside it (`audio/<key>.words.json`) and returned either way. For captions: `toSrt(captionsFromWords(wordTimings))`.
 
 ## Checks before a request
 
@@ -129,12 +198,13 @@ On v4 a vague tag can come out as a sound effect, so tags work best written as v
 
 | File | What it does |
 |---|---|
+| `src/line.ts` | `getLine`: reuse the saved recording, or call ElevenLabs and save it |
 | `src/cache.ts` | The content hash used as each recording's cache key |
 | `src/client.ts` | The `with-timestamps` call, retries and result |
 | `src/models.ts` | Per-model limits, stability steps, checks before the call |
 | `src/alignment.ts` | Character timings to word timings |
 | `src/captions.ts` | Caption splitting, wrapping and SRT output |
-| `examples/speak.ts` | One line in; audio, word timings and SRT out, skipped if unchanged |
+| `examples/speak.ts` | One line through `getLine`; prints whether it was recorded or reused |
 
 ## Licence
 
