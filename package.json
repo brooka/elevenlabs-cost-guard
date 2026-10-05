@@ -1,0 +1,22 @@
+{
+  "name": "elevenlabs-cost-guard",
+  "version": "0.1.0",
+  "description": "A careful ElevenLabs text-to-speech client: never pays twice for the same line or for a request that would fail. Word timings and captions included.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Andrew Brook",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "speak": "tsx examples/speak.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}
