@@ -1,69 +1,57 @@
 # elevenlabs-cost-guard
 
-A small TypeScript client for the ElevenLabs text-to-speech API that stops a pipeline paying again for audio it already has, and turns ElevenLabs' character timings into word timings and captions.
+A small TypeScript client for the ElevenLabs text-to-speech API that never pays twice for the same line, and returns word timings and captions with every recording.
 
-## The gap it fills
+## TL;DR
 
-The ElevenLabs API bills every request by the character, including a request identical to one made earlier. The website offers two free regenerations of identical content; the API does not ([ElevenLabs](https://elevenlabs.io/blog/two-free-regenerations)). Neither the API nor the official SDK keeps a record of what has already been generated.
+```ts
+import { ElevenLabsClient, getLine } from "./src/index.js";
 
-That matters for any pipeline that builds audio from a script and rebuilds after every edit. ElevenLabs' integration guide recommends caching each result under a hash of every input that affects the audio ([ElevenLabs, Text to Speech API integration](https://elevenlabs.io/blog/text-to-speech-api-integration)). This client implements that, and covers two smaller jobs the API leaves to the caller:
+const client = new ElevenLabsClient(process.env.ELEVENLABS_API_KEY!);
 
-| Gap | What the API and SDK provide | What this adds |
-|---|---|---|
-| Re-billing for unchanged audio | Every request is billed; past requests aren't tracked by their inputs | A hash of model, voice, language, text and direction as the cache key; unchanged lines are never sent |
-| Words, not characters | `with-timestamps` returns a start and end time per **character** | Word timings (ignoring `[audio tags]`) and SRT captions |
-| Errors found mid-batch | The API rejects bad input as each request arrives | Tags and per-model length limits are checked before anything is sent |
-
-Retries are not a gap: the official SDK retries 408, 409, 429 and 5xx responses. This client uses plain `fetch`, so it implements the rule itself: 429 and 5xx only, exponential backoff with full jitter.
-
-## How it works
-
-A script is recorded as many short requests, one per line (a narration passage, or one character's line), rather than one long request. Each recording is stored with the hash of the inputs that produced it:
-
-```
-key  = sha256(model | voice | language | text | direction)
+const { file, paid, wordTimings } = await getLine(client, {
+  voiceId: "<voice_id>",
+  text: "Guten Tag! Wie geht es dir?",
+  modelId: "eleven_v4",
+  languageCode: "de",
+});
 ```
 
-On every build, each line's key is computed again:
+- **First time a line is asked for:** ElevenLabs is called (paid) and the audio is saved as `audio/<key>.mp3`. `paid` is `true`.
+- **Every time after that:** the saved file is returned. No API call, no charge. `paid` is `false`.
+- **Change anything about the line** (text, voice, model, language or direction): it counts as a new line and is recorded once.
+- **Captions:** `toSrt(captionsFromWords(wordTimings))`.
 
-- **Same key as the stored recording:** the line is unchanged. Nothing is sent; the existing audio is reused.
-- **New key:** the text, voice, model, language or direction changed. The line is sent, and the new audio is stored under the new key.
-
-The same build therefore serves a first recording (every key is new, so every line is sent) and an edit (only changed lines have new keys). There is no separate "edit mode" to maintain.
-
-**Example: a 40-line script**
-
-| Build | Lines sent | Lines reused |
-|---|---|---|
-| First recording | 40 | 0 |
-| One line edited | 1 | 39 |
-| One character recast | that character's lines | the rest |
-| Nothing changed (picture-only edit) | 0 | 40 |
-| Model changed for the whole script | 40 | 0 |
-
-Two design points follow from the key:
-
-- **Recording per line keeps the cost of an edit small.** A whole script sent as one request would be re-billed in full after any change.
-- **Set the model per script or batch, not globally.** The model is part of every key, so a global switch re-records everything already finished. An empty direction hashes exactly like no direction, so adding direction support doesn't invalidate older recordings.
-
-Stable keys also keep edits stable. A re-recorded line rarely comes back identical (its timing and delivery vary), so reusing unchanged recordings stops timings, cuts and captions from drifting between builds.
-
-**In production:** across 103 rebuilds of a ten-script pipeline, this sent 665 lines instead of 6,408, and 90% fewer characters.
-
-## Quick start
+Call `getLine` for every line of a script on every build. Only new or edited lines cost anything.
 
 ```bash
 npm install
 npm test        # 34 tests, mocked fetch, no API key needed
 
-ELEVENLABS_API_KEY=... npm run speak -- <voice_id> "Guten Tag! Wie geht es dir?" --model eleven_v4 --lang de --tag whispering
+ELEVENLABS_API_KEY=... npm run speak -- <voice_id> "Guten Tag! Wie geht es dir?" --model eleven_v4 --lang de
+# first run:  Recorded with ElevenLabs (paid) → audio/<key>.mp3
+# second run: Reused audio/<key>.mp3 (no API call, no charge), and no API key needed
 ```
 
-`speak` records one line through `getLine` and writes `audio/<key>.mp3`, `audio/<key>.words.json` and `audio/<key>.srt`. The first run prints `Recorded with ElevenLabs (paid)`. Run the same command again and it prints `Reused … (no API call, no charge)`, and doesn't even need the API key.
+## Why it exists
 
-## Usage
+The ElevenLabs API bills every request by the character, including a request identical to one made earlier. The website offers two free regenerations of identical content; the API does not ([ElevenLabs](https://elevenlabs.io/blog/two-free-regenerations)). Neither the API nor the official SDK keeps a record of what has already been generated, so a pipeline that rebuilds from a script after every edit pays for every line again.
 
-Every line in a script goes through the same three steps:
+ElevenLabs' integration guide recommends caching each result under a hash of every input that affects the audio ([ElevenLabs, Text to Speech API integration](https://elevenlabs.io/blog/text-to-speech-api-integration)). This client implements that, and covers two smaller jobs the API leaves to the caller:
+
+| Gap | What the API and SDK provide | What this adds |
+|---|---|---|
+| Re-billing for unchanged audio | Every request is billed; past requests aren't tracked by their inputs | `getLine`: a hash of the line's inputs as its key; a saved recording is reused instead of re-requested |
+| Words, not characters | `with-timestamps` returns a start and end time per **character** | Word timings (ignoring `[audio tags]`) and SRT captions |
+| Errors found mid-batch | The API rejects bad input as each request arrives | Tags and per-model length limits are checked before anything is sent |
+
+**In production:** across 103 rebuilds of a ten-script pipeline, this sent 665 lines instead of 6,408, and 90% fewer characters.
+
+## Under the hood
+
+### The three steps
+
+Every line goes through the same steps:
 
 ```
 for each line in the script:
@@ -122,13 +110,9 @@ export async function getLine(client: TtsClient, req: TtsRequest, dir = "audio")
 }
 ```
 
-Call it for every line, on every build:
+Called over a two-line script:
 
 ```ts
-import { ElevenLabsClient, getLine } from "./src/index.js";
-
-const client = new ElevenLabsClient(process.env.ELEVENLABS_API_KEY!);
-
 const script = [
   { voiceId: "<narrator_voice_id>", text: "Der Laden öffnet um neun." },
   { voiceId: "<character_voice_id>", text: "Guten Tag! Wie geht es dir?" },
@@ -146,9 +130,31 @@ for (const line of script) {
 | Second run, nothing changed | `reused` for both lines; ElevenLabs is not called |
 | One line's text edited | `recorded` for that line only, `reused` for the other |
 
-The recording's word timings are saved beside it (`audio/<key>.words.json`) and returned either way. For captions: `toSrt(captionsFromWords(wordTimings))`.
+### The key
 
-## Checks before a request
+```
+key = sha256(model | voice | language | text | direction)
+```
+
+The key holds everything that changes the sound and nothing that doesn't, so the same inputs always produce the same key (`src/cache.ts`). For a 40-line script:
+
+| Build | Lines sent | Lines reused |
+|---|---|---|
+| First recording | 40 | 0 |
+| One line edited | 1 | 39 |
+| One character recast | that character's lines | the rest |
+| Nothing changed (picture-only edit) | 0 | 40 |
+| Model changed for the whole script | 40 | 0 |
+
+- **One request per line keeps edits cheap.** A whole script sent as one request would be re-billed in full after any change.
+- **The same build serves a first recording and an edit.** For a new script every key is new; after an edit only the changed lines' keys are. There is no separate edit mode.
+- **Set the model per script or batch, not globally.** The model is part of every key, so a global switch re-records everything already finished.
+- **An empty direction hashes exactly like no direction,** so adding direction support didn't invalidate older recordings.
+- **Reused recordings keep edits stable.** A re-recorded line rarely comes back identical (its timing and delivery vary), so reusing unchanged lines stops timings, cuts and captions from drifting between builds.
+
+### Checks before a request
+
+`ElevenLabsClient` checks every line before anything is sent (`src/models.ts`):
 
 - Direction tags: no brackets or line breaks, at most 8 per line.
 - Tags are only sent to models that read them (`eleven_v3`, `eleven_v4`).
@@ -156,9 +162,13 @@ The recording's word timings are saved beside it (`audio/<key>.words.json`) and 
 
 A failing line throws before any request is made, so a batch stops at the first bad line rather than partway through.
 
-## Word timings
+### Retries
 
-`POST /v1/text-to-speech/{voice_id}/with-timestamps` returns the audio plus a start and end time for every **character**. Captions, read-along highlighting and cutting a single word out of a recording need **words**. `wordTimingsFromAlignment` builds them:
+Retries are not a gap: the official SDK retries 408, 409, 429 and 5xx responses. This client uses plain `fetch`, so it implements the rule itself (`src/client.ts`): up to three attempts on 429 and 5xx only, with exponential backoff and full jitter. Any other error (400, 401, 422) fails at once with the status and the start of the response body.
+
+### Word timings
+
+`POST /v1/text-to-speech/{voice_id}/with-timestamps` returns the audio plus a start and end time for every **character**. Captions, read-along highlighting and cutting a single word out of a recording need **words**. `wordTimingsFromAlignment` builds them (`src/alignment.ts`):
 
 | characters | G | u | t | e | n | ␣ | T | a | g |
 |---|---|---|---|---|---|---|---|---|---|
@@ -172,9 +182,9 @@ becomes `{ word: "Guten", start: 0.00, end: 0.38 }`, `{ word: "Tag", start: 0.44
 - Anything inside `[audio tags]` is skipped, because tags are directions, not speech.
 - Word edges are typically about ±0.1 s off: fine for captions. Cutting a word out of a recording needs the edges refined against the audio's loudness envelope.
 
-## Captions
+### Captions
 
-`captionsFromWords` splits timed words the way a subtitler would:
+`captionsFromWords` splits timed words the way a subtitler would (`src/captions.ts`):
 
 1. End a caption at a sentence end, once it has some length.
 2. Otherwise, when it gets too long, break after its last comma, semicolon or colon.
@@ -183,7 +193,7 @@ becomes `{ word: "Guten", start: 0.00, end: 0.38 }`, `{ word: "Tag", start: 0.44
 
 `toSrt` writes the result as an SRT file, the format video platforms accept for uploaded captions.
 
-## Model notes
+### Model notes
 
 | | `eleven_v3` | `eleven_v4` |
 |---|---|---|
@@ -194,13 +204,13 @@ becomes `{ word: "Guten", start: 0.00, end: 0.38 }`, `{ word: "Tag", start: 0.44
 
 On v4 a vague tag can come out as a sound effect, so tags work best written as voice descriptions: "giggling softly", not "giggling".
 
-## Layout
+### Layout
 
 | File | What it does |
 |---|---|
 | `src/line.ts` | `getLine`: reuse the saved recording, or call ElevenLabs and save it |
-| `src/cache.ts` | The content hash used as each recording's cache key |
-| `src/client.ts` | The `with-timestamps` call, retries and result |
+| `src/cache.ts` | The content hash used as each recording's key |
+| `src/client.ts` | The `with-timestamps` call, checks and retries |
 | `src/models.ts` | Per-model limits, stability steps, checks before the call |
 | `src/alignment.ts` | Character timings to word timings |
 | `src/captions.ts` | Caption splitting, wrapping and SRT output |
